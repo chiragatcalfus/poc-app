@@ -79,7 +79,7 @@ resource "aws_security_group" "my_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # HTTP
+  # HTTP - port
   ingress {
     from_port   = 80
     to_port     = 80
