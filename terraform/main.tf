@@ -119,7 +119,7 @@ resource "aws_security_group" "my_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # Custom TCP: 30000 - 32767 (NodePort range)
+  # Custom TCP: 30000 - 32767 (NodePort range) -- port
   ingress {
     from_port   = 30000
     to_port     = 32767
