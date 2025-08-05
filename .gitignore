@@ -1,0 +1,60 @@
+# --- Terraform ignores scoped to terraform/ directory ---
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/.terraform/*
+terraform/.terraform.lock.hcl
+terraform/crash.log
+terraform/*.tfplan
+terraform/*.backup
+terraform/*.log
+terraform/pic-key.pem
+terraform/*.auto.tfvars
+terraform/*.auto.tfvars.json
+terraform/*.tfvars
+terraform/*.tfvars.json
+
+/terraform/override.tf
+/terraform/override.tf.json
+/terraform/*_override.tf
+/terraform/*_override.tf.json
+
+# --- Ansible ignores scoped to ansible/ directory ---
+/ansible/*.retry
+/ansible/*.log
+ansible/fact_cache/
+ansible/host_vars/*.retry
+ansible/group_vars/*.retry
+
+ansible/*.vault
+ansible/*.vault.yaml
+ansible/*.secrets
+ansible/*.enc
+ansible/vault_pass.txt
+ansible/*.key
+
+# Optional: Ignore encrypted secrets (if not using Ansible Vault properly)
+ansible/secrets.yml
+ansible/private_vars.yml
+
+# Optional: Ignore Galaxy-installed roles, but keep requirements.yml
+
+!ansible/roles/requirements.yml
+!ansible/roles/my_custom_roles*/
+
+# --- General ignores ---
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.sw?
+*~
+*.tmp
+*.bak
+*.orig
+*.swp
+
+# Optional: Python venv (for Ansible dev environments)
+ansible/.venv/
+ansible/env/
+ansible/venv/

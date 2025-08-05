@@ -1,0 +1,376 @@
+#SPDX-License-Identifier: MIT-0
+---
+# tasks file for slave
+# SPDX-License-Identifier: MIT-0
+
+# Pre-flight checks and system preparation
+- name: Check system RAM
+  ansible.builtin.shell: |
+    total_ram=$(free -m | awk 'NR==2{print $2}')
+    echo "Total RAM: ${total_ram}MB"
+    if [ $total_ram -lt 1700 ]; then
+      echo "WARNING: System has ${total_ram}MB RAM, but Kubernetes recommends minimum 1700MB for worker nodes"
+    fi
+  register: ram_check
+  changed_when: false
+
+- name: Display RAM check results
+  ansible.builtin.debug:
+    msg: "{{ ram_check.stdout }}"
+
+# Load required kernel modules
+- name: Load br_netfilter kernel module
+  ansible.builtin.modprobe:
+    name: br_netfilter
+    state: present
+  become: true
+
+- name: Load overlay kernel module
+  ansible.builtin.modprobe:
+    name: overlay
+    state: present
+  become: true
+
+- name: Make kernel modules persistent
+  ansible.builtin.copy:
+    content: |
+      br_netfilter
+      overlay
+    dest: /etc/modules-load.d/k8s.conf
+    mode: '0644'
+  become: true
+
+# Configure sysctl settings for Kubernetes
+- name: Configure sysctl for Kubernetes
+  ansible.builtin.copy:
+    content: |
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward                 = 1
+    dest: /etc/sysctl.d/k8s.conf
+    mode: '0644'
+  become: true
+
+- name: Apply sysctl settings
+  ansible.builtin.command: sysctl --system
+  become: true
+  changed_when: true
+
+# Configure Docker as container runtime for Kubernetes
+- name: Create Docker daemon configuration directory
+  ansible.builtin.file:
+    path: /etc/docker
+    state: directory
+    mode: '0755'
+  become: true
+
+- name: Configure Docker daemon for Kubernetes
+  ansible.builtin.copy:
+    content: |
+      {
+        "exec-opts": ["native.cgroupdriver=systemd"],
+        "log-driver": "json-file",
+        "log-opts": {
+          "max-size": "100m"
+        },
+        "storage-driver": "overlay2"
+      }
+    dest: /etc/docker/daemon.json
+    mode: '0644'
+  become: true
+  notify: restart docker
+
+- name: Restart Docker service
+  ansible.builtin.systemd:
+    name: docker
+    state: restarted
+    enabled: yes
+  become: true
+
+# Install and configure cri-dockerd (Updated to latest stable v0.3.17)
+- name: Download cri-dockerd (latest stable v0.3.17)
+  ansible.builtin.get_url:
+    url: "https://github.com/Mirantis/cri-dockerd/releases/download/v0.3.17/cri-dockerd-0.3.17.amd64.tgz"
+    dest: /tmp/cri-dockerd.tgz
+    mode: '0644'
+  become: true
+  # FIX: Updated from v0.3.4 to v0.3.17 to match master node
+
+- name: Extract cri-dockerd
+  ansible.builtin.unarchive:
+    src: /tmp/cri-dockerd.tgz
+    dest: /tmp
+    remote_src: yes
+  become: true
+
+- name: Install cri-dockerd binary
+  ansible.builtin.copy:
+    src: /tmp/cri-dockerd/cri-dockerd
+    dest: /usr/local/bin/cri-dockerd
+    mode: '0755'
+    remote_src: yes
+  become: true
+
+- name: Create cri-dockerd systemd service
+  ansible.builtin.copy:
+    content: |
+      [Unit]
+      Description=CRI Interface for Docker Application Container Engine
+      Documentation=https://docs.mirantis.com
+      After=network-online.target firewalld.service docker.service
+      Wants=network-online.target
+      Requires=cri-docker.socket
+
+      [Service]
+      Type=notify
+      ExecStart=/usr/local/bin/cri-dockerd --container-runtime-endpoint fd://
+      ExecReload=/bin/kill -s HUP $MAINPID
+      TimeoutSec=0
+      RestartSec=2
+      Restart=always
+
+      StartLimitBurst=3
+      StartLimitInterval=60s
+
+      LimitNOFILE=infinity
+      LimitNPROC=infinity
+      LimitCORE=infinity
+
+      TasksMax=infinity
+      Delegate=yes
+      KillMode=process
+
+      [Install]
+      WantedBy=multi-user.target
+    dest: /etc/systemd/system/cri-docker.service
+    mode: '0644'
+  become: true
+
+- name: Create cri-dockerd socket service
+  ansible.builtin.copy:
+    content: |
+      [Unit]
+      Description=CRI Docker Socket for the API
+      PartOf=cri-docker.service
+
+      [Socket]
+      ListenStream=%t/cri-dockerd.sock
+      SocketMode=0660
+      SocketUser=root
+      SocketGroup=docker
+
+      [Install]
+      WantedBy=sockets.target
+    dest: /etc/systemd/system/cri-docker.socket
+    mode: '0644'
+  become: true
+
+- name: Reload systemd and start cri-dockerd
+  ansible.builtin.systemd:
+    daemon_reload: yes
+    name: "{{ item }}"
+    enabled: yes
+    state: started
+  loop:
+    - cri-docker.socket
+    - cri-docker.service
+  become: true
+
+# FIX: Wait for cri-dockerd to be fully ready before proceeding
+- name: Wait for cri-dockerd socket to be ready
+  ansible.builtin.wait_for:
+    path: /var/run/cri-dockerd.sock
+    timeout: 60
+  become: true
+
+# Get join command from master node with improved error handling
+- name: Check if master node join command file exists
+  ansible.builtin.stat:
+    path: /tmp/kubernetes-join-command
+  register: join_file_stat
+  delegate_to: "{{ groups['master'][0] }}"
+  become: true
+
+- name: Fail if join command file doesn't exist on master
+  ansible.builtin.fail:
+    msg: "Join command file not found on master node. Please ensure master setup completed successfully."
+  when: not join_file_stat.stat.exists
+
+- name: Fetch join command from master
+  ansible.builtin.slurp:
+    src: /tmp/kubernetes-join-command
+  register: join_command_file
+  delegate_to: "{{ groups['master'][0] }}"
+  become: true
+
+- name: Set join command fact
+  ansible.builtin.set_fact:
+    join_command: "{{ join_command_file['content'] | b64decode | trim }}"
+
+- name: Display join command (masked for security)
+  ansible.builtin.debug:
+    msg: "Join command received from master node"
+
+# FIX: Improved cluster membership check
+- name: Check if node is already part of cluster
+  ansible.builtin.shell: |
+    kubectl get nodes --no-headers 2>/dev/null | grep -w "{{ ansible_hostname }}" || echo "not_found"
+  register: node_status
+  delegate_to: "{{ groups['master'][0] }}"
+  become: true
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  failed_when: false
+  changed_when: false
+
+- name: Check if current node is in cluster
+  ansible.builtin.set_fact:
+    node_already_joined: "{{ 'not_found' not in node_status.stdout and ansible_hostname in node_status.stdout }}"
+
+- name: Display node join status
+  ansible.builtin.debug:
+    msg: "Node {{ ansible_hostname }} already joined: {{ node_already_joined }}"
+
+# FIX: Reset node if partially joined but not ready
+- name: Check if kubelet is running but node not ready
+  ansible.builtin.systemd:
+    name: kubelet
+  register: kubelet_status
+  failed_when: false
+
+- name: Reset partially joined node if needed
+  ansible.builtin.command: kubeadm reset --force --cri-socket=unix:///var/run/cri-dockerd.sock
+  become: true
+  when: 
+    - kubelet_status.status is defined
+    - kubelet_status.status.ActiveState == "active"
+    - not node_already_joined
+  ignore_errors: true
+
+# Join the worker node to the cluster with improved error handling
+- name: Join worker node to cluster
+  ansible.builtin.command: "{{ join_command }}"
+  register: join_result
+  become: true
+  when: not node_already_joined
+  failed_when: 
+    - join_result.rc != 0 
+    - "'already exists' not in join_result.stderr"
+    - "'already part of' not in join_result.stderr"
+
+- name: Display join result
+  ansible.builtin.debug:
+    msg: "{{ join_result.stdout if join_result.stdout is defined else 'Node was already part of cluster' }}"
+  when: join_result is defined
+
+# FIX: Comprehensive verification with better error handling
+- name: Wait for node to appear in cluster
+  ansible.builtin.shell: |
+    kubectl get nodes --no-headers 2>/dev/null | grep -w "{{ ansible_hostname }}" || echo "not_found"
+  register: verify_node
+  delegate_to: "{{ groups['master'][0] }}"
+  become: true
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  until: "'not_found' not in verify_node.stdout and ansible_hostname in verify_node.stdout"
+  retries: 30
+  delay: 10
+  failed_when: false
+
+- name: Fail if node didn't join successfully
+  ansible.builtin.fail:
+    msg: "Node {{ ansible_hostname }} failed to join the cluster after 5 minutes"
+  when: "'not_found' in verify_node.stdout"
+
+# FIX: Wait for kubelet to be ready
+- name: Wait for kubelet service to be active
+  ansible.builtin.systemd:
+    name: kubelet
+  register: kubelet_service
+  until: kubelet_service.status.ActiveState == "active"
+  retries: 30
+  delay: 10
+  become: true
+
+- name: Wait for node to be ready
+  ansible.builtin.shell: |
+    kubectl get node {{ ansible_hostname }} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False"
+  register: node_ready_status
+  delegate_to: "{{ groups['master'][0] }}"
+  become: true
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  until: node_ready_status.stdout == "True"
+  retries: 60  # FIX: Increased retries as worker nodes can take longer to be ready
+  delay: 10
+
+# FIX: Verify all system pods are running on this node
+- name: Wait for system pods to be scheduled on node
+  ansible.builtin.shell: |
+    kubectl get pods --all-namespaces --field-selector spec.nodeName={{ ansible_hostname }} --no-headers 2>/dev/null | grep -v Running | grep -v Completed | wc -l
+  register: pending_system_pods
+  delegate_to: "{{ groups['master'][0] }}"
+  become: true
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  until: pending_system_pods.stdout|int == 0
+  retries: 30
+  delay: 10
+
+- name: Display final node status
+  ansible.builtin.shell: |
+    echo "=== NODE STATUS ===" && \
+    kubectl get nodes {{ ansible_hostname }} -o wide && \
+    echo "" && \
+    echo "=== PODS ON THIS NODE ===" && \
+    kubectl get pods --all-namespaces --field-selector spec.nodeName={{ ansible_hostname }} --no-headers | head -10
+  register: final_status
+  delegate_to: "{{ groups['master'][0] }}"
+  become: true
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+
+- name: Show worker node final status
+  ansible.builtin.debug:
+    msg: "{{ final_status.stdout }}"
+
+# FIX: Display cluster overview
+- name: Display complete cluster status
+  ansible.builtin.shell: |
+    echo "=== COMPLETE CLUSTER STATUS ===" && \
+    kubectl get nodes -o wide && \
+    echo "" && \
+    echo "=== CLUSTER INFO ===" && \
+    kubectl cluster-info
+  register: cluster_overview
+  delegate_to: "{{ groups['master'][0] }}"
+  become: true
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  run_once: true
+
+- name: Show complete cluster overview
+  ansible.builtin.debug:
+    msg: "{{ cluster_overview.stdout }}"
+  run_once: true
+
+# FIX: Cleanup temporary files
+- name: Clean up temporary files
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /tmp/cri-dockerd.tgz
+    - /tmp/cri-dockerd
+  become: true
+
+# FIX: Final verification message
+- name: Final success message
+  ansible.builtin.debug:
+    msg: "✅ SUCCESS: Worker node {{ ansible_hostname }} has successfully joined the Kubernetes cluster and is ready!"

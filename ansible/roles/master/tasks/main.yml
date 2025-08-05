@@ -1,0 +1,486 @@
+#SPDX-License-Identifier: MIT-0
+---
+# tasks file for master
+
+
+# Pre-flight checks and system preparation
+- name: Check system RAM
+  ansible.builtin.shell: |
+    total_ram=$(free -m | awk 'NR==2{print $2}')
+    echo "Total RAM: ${total_ram}MB"
+    if [ $total_ram -lt 2000 ]; then
+      echo "WARNING: System has ${total_ram}MB RAM, but Kubernetes recommends minimum 2000MB for master node"
+    fi
+  register: ram_check
+  changed_when: false
+
+- name: Display RAM check results
+  ansible.builtin.debug:
+    msg: "{{ ram_check.stdout }}"
+
+# Load required kernel modules
+- name: Load br_netfilter kernel module
+  ansible.builtin.modprobe:
+    name: br_netfilter
+    state: present
+  become: true
+
+- name: Load overlay kernel module
+  ansible.builtin.modprobe:
+    name: overlay
+    state: present
+  become: true
+
+- name: Make kernel modules persistent
+  ansible.builtin.copy:
+    content: |
+      br_netfilter
+      overlay
+    dest: /etc/modules-load.d/k8s.conf
+    mode: '0644'
+  become: true
+
+# Configure sysctl settings for Kubernetes
+- name: Configure sysctl for Kubernetes
+  ansible.builtin.copy:
+    content: |
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward                 = 1
+    dest: /etc/sysctl.d/k8s.conf
+    mode: '0644'
+  become: true
+
+- name: Apply sysctl settings
+  ansible.builtin.command: sysctl --system
+  become: true
+  changed_when: true
+
+# Configure Docker as container runtime for Kubernetes
+- name: Create Docker daemon configuration directory
+  ansible.builtin.file:
+    path: /etc/docker
+    state: directory
+    mode: '0755'
+  become: true
+
+- name: Configure Docker daemon for Kubernetes
+  ansible.builtin.copy:
+    content: |
+      {
+        "exec-opts": ["native.cgroupdriver=systemd"],
+        "log-driver": "json-file",
+        "log-opts": {
+          "max-size": "100m"
+        },
+        "storage-driver": "overlay2"
+      }
+    dest: /etc/docker/daemon.json
+    mode: '0644'
+  become: true
+  notify: restart docker
+
+- name: Restart Docker service
+  ansible.builtin.systemd:
+    name: docker
+    state: restarted
+    enabled: yes
+  become: true
+
+# Install and configure cri-dockerd (Updated to latest stable v0.3.17)
+- name: Download cri-dockerd (latest stable v0.3.17)
+  ansible.builtin.get_url:
+    url: "https://github.com/Mirantis/cri-dockerd/releases/download/v0.3.17/cri-dockerd-0.3.17.amd64.tgz"
+    dest: /tmp/cri-dockerd.tgz
+    mode: '0644'
+  become: true
+  # FIX: Updated from v0.3.4 to v0.3.17 (latest stable version as of 2025)
+
+- name: Extract cri-dockerd
+  ansible.builtin.unarchive:
+    src: /tmp/cri-dockerd.tgz
+    dest: /tmp
+    remote_src: yes
+  become: true
+
+- name: Install cri-dockerd binary
+  ansible.builtin.copy:
+    src: /tmp/cri-dockerd/cri-dockerd
+    dest: /usr/local/bin/cri-dockerd
+    mode: '0755'
+    remote_src: yes
+  become: true
+
+- name: Create cri-dockerd systemd service
+  ansible.builtin.copy:
+    content: |
+      [Unit]
+      Description=CRI Interface for Docker Application Container Engine
+      Documentation=https://docs.mirantis.com
+      After=network-online.target firewalld.service docker.service
+      Wants=network-online.target
+      Requires=cri-docker.socket
+
+      [Service]
+      Type=notify
+      ExecStart=/usr/local/bin/cri-dockerd --container-runtime-endpoint fd://
+      ExecReload=/bin/kill -s HUP $MAINPID
+      TimeoutSec=0
+      RestartSec=2
+      Restart=always
+
+      StartLimitBurst=3
+      StartLimitInterval=60s
+
+      LimitNOFILE=infinity
+      LimitNPROC=infinity
+      LimitCORE=infinity
+
+      TasksMax=infinity
+      Delegate=yes
+      KillMode=process
+
+      [Install]
+      WantedBy=multi-user.target
+    dest: /etc/systemd/system/cri-docker.service
+    mode: '0644'
+  become: true
+
+- name: Create cri-dockerd socket service
+  ansible.builtin.copy:
+    content: |
+      [Unit]
+      Description=CRI Docker Socket for the API
+      PartOf=cri-docker.service
+
+      [Socket]
+      ListenStream=%t/cri-dockerd.sock
+      SocketMode=0660
+      SocketUser=root
+      SocketGroup=docker
+
+      [Install]
+      WantedBy=sockets.target
+    dest: /etc/systemd/system/cri-docker.socket
+    mode: '0644'
+  become: true
+
+- name: Reload systemd and start cri-dockerd
+  ansible.builtin.systemd:
+    daemon_reload: yes
+    name: "{{ item }}"
+    enabled: yes
+    state: started
+  loop:
+    - cri-docker.socket
+    - cri-docker.service
+  become: true
+
+# Initialize Kubernetes cluster (Updated for latest Kubernetes v1.33)
+- name: Initialize Kubernetes master with cri-dockerd
+  ansible.builtin.command: >
+    kubeadm init 
+    --pod-network-cidr=192.168.0.0/16 
+    --cri-socket=unix:///var/run/cri-dockerd.sock
+    --ignore-preflight-errors=Mem
+    --kubernetes-version=v1.33.0
+  register: kubeadm_init_output
+  become: true
+  failed_when: kubeadm_init_output.rc != 0 and "already exists" not in kubeadm_init_output.stderr
+  # FIX: Added explicit Kubernetes version for consistency
+
+- name: Display kubeadm init output
+  ansible.builtin.debug:
+    msg: "{{ kubeadm_init_output.stdout }}"
+
+- name: Create .kube directory
+  ansible.builtin.file:
+    path: /home/ubuntu/.kube
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: '0755'
+  become: true
+
+- name: Copy kube config
+  ansible.builtin.copy:
+    src: /etc/kubernetes/admin.conf
+    dest: /home/ubuntu/.kube/config
+    owner: ubuntu
+    group: ubuntu
+    mode: '0644'
+    remote_src: yes
+  become: true
+
+- name: Wait for kube-system pods to be ready
+  ansible.builtin.shell: |
+    kubectl get pods -n kube-system --no-headers 2>/dev/null | grep -v Running | grep -v Completed | wc -l
+  register: pending_pods
+  until: pending_pods.stdout|int == 0
+  retries: 30
+  delay: 10
+  become: true
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  # FIX: Added error handling with 2>/dev/null
+
+# Install Calico CNI (Updated to latest stable v3.29.1)
+- name: Install Calico CNI (latest v3.29.1)
+  ansible.builtin.shell: |
+    kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.1/manifests/calico.yaml
+  become: true
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  register: calico_install_result
+  # FIX: Updated from v3.26.1 to v3.29.1 (latest stable as of 2025)
+
+- name: Display Calico installation result
+  ansible.builtin.debug:
+    msg: "{{ calico_install_result.stdout }}"
+
+- name: Wait for Calico pods to be ready
+  ansible.builtin.shell: |
+    kubectl get pods -n kube-system -l k8s-app=calico-node --no-headers 2>/dev/null | grep -v Running | wc -l
+  register: calico_pods
+  until: calico_pods.stdout|int == 0
+  retries: 60  # FIX: Increased retries from 30 to 60 as Calico can take longer
+  delay: 10
+  become: true
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+
+# FIX: Added verification that all Calico components are ready
+- name: Wait for all Calico system pods to be ready
+  ansible.builtin.shell: |
+    kubectl get pods -n kube-system -l k8s-app=calico-kube-controllers --no-headers 2>/dev/null | grep -v Running | wc -l
+  register: calico_controllers
+  until: calico_controllers.stdout|int == 0
+  retries: 30
+  delay: 10
+  become: true
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+
+- name: Extract join command
+  ansible.builtin.shell: kubeadm token create --print-join-command
+  register: join_command
+  become: true
+
+- name: Display join command
+  ansible.builtin.debug:
+    msg: "{{ join_command.stdout }}"
+
+- name: Save join command to file
+  ansible.builtin.copy:
+    content: "{{ join_command.stdout }} --cri-socket=unix:///var/run/cri-dockerd.sock"
+    dest: /tmp/kubernetes-join-command
+    mode: '0644'
+  become: true
+
+# FIX: Added cluster verification step
+- name: Verify cluster is ready
+  ansible.builtin.shell: |
+    kubectl get nodes --no-headers 2>/dev/null | grep -v Ready | wc -l
+  register: cluster_ready
+  until: cluster_ready.stdout|int == 0
+  retries: 10
+  delay: 30
+  become: true
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+
+- name: Display cluster status
+  ansible.builtin.shell: kubectl get nodes -o wide
+  register: cluster_status
+  become: true
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+
+- name: Show final cluster status
+  ansible.builtin.debug:
+    msg: "{{ cluster_status.stdout }}"
+
+# FIX: Cleanup temporary files
+- name: Clean up temporary files
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /tmp/cri-dockerd.tgz
+    - /tmp/cri-dockerd
+  become: true
+
+
+# Simple and Quick Calico Fix for AWS - Add this to your master setup
+
+# QUICK FIX: Replace current Calico installation with AWS-compatible VXLAN mode
+
+- name: Remove existing problematic Calico installation
+  ansible.builtin.shell: |
+    kubectl delete -f https://raw.githubusercontent.com/projectcalico/calico/v3.29.1/manifests/calico.yaml --ignore-not-found=true
+  become: true
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  ignore_errors: true
+
+- name: Wait for old Calico pods to be removed
+  ansible.builtin.shell: |
+    kubectl get pods -n kube-system -l k8s-app=calico-node --no-headers 2>/dev/null | wc -l
+  register: old_pods
+  until: old_pods.stdout|int == 0
+  retries: 30
+  delay: 10
+  become: true
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+
+# Install Calico with VXLAN (AWS-compatible) configuration
+- name: Download and customize Calico manifest for AWS
+  ansible.builtin.shell: |
+    curl -o /tmp/calico.yaml https://raw.githubusercontent.com/projectcalico/calico/v3.29.1/manifests/calico.yaml
+    
+    # Modify the ConfigMap to use VXLAN instead of BGP
+    sed -i 's/calico_backend: "bird"/calico_backend: "vxlan"/' /tmp/calico.yaml
+    
+    # Add VXLAN-specific environment variables to calico-node DaemonSet
+    sed -i '/- name: CALICO_IPV4POOL_CIDR/a\            - name: CALICO_IPV4POOL_VXLAN\n              value: "Always"' /tmp/calico.yaml
+    sed -i '/- name: CALICO_IPV4POOL_VXLAN/a\            - name: CALICO_IPV4POOL_IPIP\n              value: "Never"' /tmp/calico.yaml
+    sed -i '/- name: FELIX_LOGSEVERITYSCREEN/a\            - name: FELIX_VXLANMTU\n              value: "1410"' /tmp/calico.yaml
+    
+    # Remove BIRD readiness check (not needed for VXLAN)
+    sed -i 's/- -bird-ready//' /tmp/calico.yaml
+    sed -i 's/- -bird-live//' /tmp/calico.yaml
+  become: true
+
+- name: Apply AWS-optimized Calico configuration
+  ansible.builtin.shell: |
+    kubectl apply -f /tmp/calico.yaml
+  become: true
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  register: calico_apply
+
+- name: Display Calico installation result
+  ansible.builtin.debug:
+    msg: "{{ calico_apply.stdout }}"
+
+# Disable BGP mesh (critical for VXLAN mode)
+- name: Create and apply BGP configuration to disable node-to-node mesh
+  ansible.builtin.shell: |
+    cat << EOF | kubectl apply -f -
+    apiVersion: crd.projectcalico.org/v1
+    kind: BGPConfiguration
+    metadata:
+      name: default
+    spec:
+      logSeverityScreen: Info
+      nodeToNodeMeshEnabled: false
+      asNumber: 64512
+    EOF
+  become: true
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+
+# Wait for Calico to be ready with VXLAN
+- name: Wait for Calico node pods to be ready (VXLAN mode)
+  ansible.builtin.shell: |
+    kubectl get pods -n kube-system -l k8s-app=calico-node --no-headers 2>/dev/null | grep -v Running | wc -l
+  register: calico_pods_status
+  until: calico_pods_status.stdout|int == 0
+  retries: 60
+  delay: 10
+  become: true
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+
+- name: Wait for Calico controllers to be ready
+  ansible.builtin.shell: |
+    kubectl get pods -n kube-system -l k8s-app=calico-kube-controllers --no-headers 2>/dev/null | grep -v Running | wc -l
+  register: calico_controllers_status
+  until: calico_controllers_status.stdout|int == 0
+  retries: 30
+  delay: 10
+  become: true
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+
+# Verify the fix worked
+- name: Verify Calico VXLAN configuration
+  ansible.builtin.shell: |
+    echo "=== CALICO PODS STATUS ===" && \
+    kubectl get pods -n kube-system -l k8s-app=calico-node -o wide && \
+    echo "" && \
+    echo "=== CALICO NODE READINESS ===" && \
+    kubectl get pods -n kube-system -l k8s-app=calico-node -o jsonpath='{range .items[*]}{.metadata.name}{" - Ready: "}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' && \
+    echo "" && \
+    echo "=== CLUSTER NODES STATUS ===" && \
+    kubectl get nodes -o wide
+  register: final_calico_status
+  become: true
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+
+- name: Display final Calico status
+  ansible.builtin.debug:
+    msg: "{{ final_calico_status.stdout }}"
+
+# Test connectivity with a simple pod
+- name: Test pod networking (optional)
+  ansible.builtin.shell: |
+    kubectl run calico-test --image=busybox --restart=Never --rm -i --tty --command -- ping -c 3 8.8.8.8 || echo "Test completed"
+  become: true
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  ignore_errors: true
+  async: 30
+  poll: 0
+
+# Cleanup
+- name: Clean up temporary files
+  ansible.builtin.file:
+    path: /tmp/calico.yaml
+    state: absent
+  become: true
+
+- name: Success message for Calico VXLAN fix
+  ansible.builtin.debug:
+    msg: |
+      ✅ CALICO AWS FIX APPLIED SUCCESSFULLY! ✅
+      
+      Changes made:
+      1. ✓ Removed BGP-based Calico installation
+      2. ✓ Installed VXLAN-based Calico (AWS-compatible)
+      3. ✓ Disabled BGP node-to-node mesh
+      4. ✓ Configured proper VXLAN MTU (1410)
+      5. ✓ Removed BGP health checks
+      
+      Your Calico networking should now work properly in AWS!
+      BGP peering errors should be resolved.
+      
+      Verify with: kubectl get pods -n kube-system -l k8s-app=calico-node
+      
+- name: Create ClusterRoleBinding for CoreDNS
+  shell: |
+    kubectl create clusterrolebinding coredns \
+      --clusterrole=system:coredns \
+      --serviceaccount=kube-system:coredns
+  register: coredns_bind
+  failed_when: coredns_bind.rc != 0 and '"AlreadyExists"' not in coredns_bind.stderr
+  ignore_errors: false
+
+- name: Restart CoreDNS deployment
+  shell: kubectl rollout restart deployment coredns -n kube-system

@@ -1,0 +1,143 @@
+#SPDX-License-Identifier: MIT-0
+---
+# tasks file for common
+
+# tasks file for common
+- name: Install container runtime dependencies
+  ansible.builtin.apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - software-properties-common
+      - gpg  # FIX: Added gpg package as it's required for keyring operations
+    state: present
+    update_cache: yes
+
+# --- Docker Setup (with proper keyring management) ---
+- name: Ensure /etc/apt/keyrings exists for Docker
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+  become: true
+
+- name: Download and add Docker GPG key (proper method)
+  ansible.builtin.shell: |
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  args:
+    creates: /etc/apt/keyrings/docker.gpg
+  become: true
+
+# FIX: Removed the complex shell task for old key cleanup - apt-key is deprecated
+# The old method was using deprecated apt-key commands
+
+- name: Set correct permissions on Docker GPG key
+  ansible.builtin.file:
+    path: /etc/apt/keyrings/docker.gpg
+    mode: '0644'
+    owner: root
+    group: root
+  become: true
+
+- name: Add Docker repository
+  ansible.builtin.apt_repository:
+    repo: "deb [arch={{ 'amd64' if ansible_architecture == 'x86_64' else ansible_architecture }} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ansible_facts['distribution_release'] }} stable"
+    state: present
+    filename: docker  # FIX: Added explicit filename to avoid conflicts
+    update_cache: true
+
+- name: Install Docker
+  ansible.builtin.apt:
+    name: docker-ce
+    state: present  # FIX: Changed from 'latest' to 'present' for stability
+    update_cache: yes
+
+- name: Enable and start Docker
+  ansible.builtin.systemd:
+    name: docker
+    enabled: yes
+    state: started
+
+- name: Disable swap permanently
+  ansible.builtin.command: swapoff -a
+  changed_when: true
+  become: true
+
+- name: Comment swap entries in fstab
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^([^#].*swap.*)$'
+    replace: '# \1'
+  become: true
+
+# --- KUBERNETES TASKS (Updated to v1.33 - Latest Stable) ---
+- name: Ensure /etc/apt/keyrings directory exists for Kubernetes
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+  become: true
+
+- name: Remove any pre-existing Kubernetes apt source list files
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/apt/sources.list.d/kubernetes.list
+    - /etc/apt/sources.list.d/kubernetes-archive-keyring.list
+  become: true
+
+# FIX: Removed shell task for apt-key cleanup as apt-key is deprecated and causes issues
+
+- name: Download and add Kubernetes GPG key (latest stable v1.33)
+  ansible.builtin.shell: |
+    curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.33/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  args:
+    creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  become: true
+  # FIX: Updated from v1.29 to v1.33 (latest stable as of August 2025)
+
+- name: Set correct permissions on Kubernetes GPG key
+  ansible.builtin.file:
+    path: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    mode: '0644'
+    owner: root
+    group: root
+  become: true
+
+- name: Add Kubernetes APT repository (official v1.33 repository)
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.33/deb/ /"
+    filename: kubernetes
+    state: present
+    update_cache: no  # We'll update cache in the next task
+  become: true
+  # FIX: Updated from v1.29 to v1.33 (latest stable)
+
+- name: Update apt cache after adding Kubernetes repository
+  ansible.builtin.apt:
+    update_cache: yes
+  become: true
+
+- name: Install kubelet, kubeadm and kubectl
+  ansible.builtin.apt:
+    name:
+      - kubelet
+      - kubeadm
+      - kubectl
+    state: present
+    update_cache: yes
+  become: true
+
+# FIX: Removed commented duplicate cache update task
+
+- name: Hold Kubernetes packages
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop:
+    - kubelet
+    - kubeadm
+    - kubectl
+  become: true
