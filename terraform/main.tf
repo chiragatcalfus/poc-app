@@ -95,7 +95,7 @@ resource "aws_security_group" "my_sg" {
     cidr_blocks = ["192.168.0.0/16"]
   }
 
-  # Custom TCP: 8080
+  # Custom TCP: 8080 - port
   ingress {
     from_port   = 8080
     to_port     = 8080
